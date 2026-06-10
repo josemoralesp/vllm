@@ -232,10 +232,12 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         super().validate_num_items(modality, num_items)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        limits: dict[str, int | None] = {"image": None}
+        limits: dict[str, int | None] = {}
+        if self.get_hf_config().vision_config is not None:
+            limits["image"] = None
+            limits["video"] = None
         if self.get_hf_config().audio_config is not None:
             limits["audio"] = None
-        limits["video"] = None
         return limits
 
     def get_mm_max_tokens_per_item(
@@ -245,12 +247,14 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         # Upper bound: the pooler outputs max_soft_tokens slots per image.
         # After padding is stripped the actual count is ≤ this value, but
         # vLLM needs the max for memory planning.
-        tokens_per_image = config.vision_config.default_output_length
-        merged_kwargs = self.ctx.get_merged_mm_kwargs({})
-        val, _ = _get_max_soft_tokens(merged_kwargs)
-        if isinstance(val, int) and val in _SUPPORTED_SOFT_TOKENS:
-            tokens_per_image = val
-        tokens: dict[str, int] = {"image": tokens_per_image}
+        tokens: dict[str, int] = {}
+        if config.vision_config is not None:
+            tokens_per_image = config.vision_config.default_output_length
+            merged_kwargs = self.ctx.get_merged_mm_kwargs({})
+            val, _ = _get_max_soft_tokens(merged_kwargs)
+            if isinstance(val, int) and val in _SUPPORTED_SOFT_TOKENS:
+                tokens_per_image = val
+            tokens["image"] = tokens_per_image
         if config.audio_config is not None:
             # Audio max tokens from the processor's audio_seq_length.
             processor = self.get_hf_processor()
@@ -1028,28 +1032,36 @@ class Gemma4ForConditionalGeneration(
             "compressed-tensors",
         ]:
             tower_quant = quant_config
-        else:
+        elif config.vision_config is not None:
             vision_cfg = config.vision_config
             quantizable = (
                 vision_cfg.hidden_size % 64 == 0
                 and vision_cfg.intermediate_size % 64 == 0
             )
             tower_quant = quant_config if quantizable else None
+        else:
+            tower_quant = None
 
         # ---- Vision tower (shared by image and video) ----
-        with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.vision_tower = AutoModel.from_config(config=config.vision_config)
-            self.embed_vision = Gemma4MultimodalEmbedder(
-                config.vision_config,
-                config.text_config,
-                quant_config=tower_quant,
-                prefix=maybe_prefix(prefix, "embed_vision"),
-            )
-            recursive_replace_linear(
-                self.vision_tower,
-                tower_quant,
-                prefix=maybe_prefix(prefix, "vision_tower"),
-            )
+        if config.vision_config is not None:
+            with self._mark_tower_model(vllm_config, {"image", "video"}):
+                self.vision_tower = AutoModel.from_config(
+                    config=config.vision_config
+                )
+                self.embed_vision = Gemma4MultimodalEmbedder(
+                    config.vision_config,
+                    config.text_config,
+                    quant_config=tower_quant,
+                    prefix=maybe_prefix(prefix, "embed_vision"),
+                )
+                recursive_replace_linear(
+                    self.vision_tower,
+                    tower_quant,
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
 
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
@@ -1667,6 +1679,14 @@ class Gemma4ForConditionalGeneration(
             "embed_vision.embedding.",
             "embed_audio.embedding.",
         ]
+        # Models without vision tower should skip vision weights entirely.
+        if self.vision_tower is None:
+            ignore_prefixes.extend(
+                [
+                    "vision_tower.",
+                    "embed_vision.",
+                ]
+            )
         # Models without audio tower should skip audio weights entirely.
         if self.audio_tower is None:
             ignore_prefixes.extend(
@@ -1687,8 +1707,11 @@ class Gemma4ForConditionalGeneration(
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefix mapping for multimodal models."""
-        connectors = ["embed_vision"]
-        tower_models = ["vision_tower"]
+        connectors = []
+        tower_models = []
+        if self.vision_tower is not None:
+            connectors.append("embed_vision")
+            tower_models.append("vision_tower")
         if self.audio_tower is not None:
             connectors.append("embed_audio")
             tower_models.append("audio_tower")
